@@ -65,6 +65,135 @@ async fn file_storage_save_persists_auth_dot_json() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn file_storage_save_preserves_an_in_progress_read() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+    let original = AuthDotJson {
+        auth_mode: Some(AuthMode::ApiKey),
+        openai_api_key: Some("old-key".repeat(1024)),
+        tokens: None,
+        last_refresh: None,
+        agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
+        bedrock_access_keys: None,
+    };
+    storage.save(&original)?;
+
+    // A second process can already be reading the file when credentials rotate.
+    let mut reader = File::open(get_auth_file(codex_home.path()))?;
+    let mut contents = vec![0; serde_json::to_vec_pretty(&original)?.len() / 2];
+    reader.read_exact(&mut contents)?;
+
+    let replacement = AuthDotJson {
+        openai_api_key: Some("new-key".to_string()),
+        ..original.clone()
+    };
+    storage.save(&replacement)?;
+    reader.read_to_end(&mut contents)?;
+
+    let read_auth: AuthDotJson = serde_json::from_slice(&contents)?;
+    assert_eq!(read_auth, original);
+    assert_eq!(storage.load()?, Some(replacement));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn file_storage_save_uses_private_permissions() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let codex_home = tempdir()?;
+    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+    let auth = serde_json::from_value(json!({"OPENAI_API_KEY": "test-key"}))?;
+    let auth_file = get_auth_file(codex_home.path());
+
+    storage.save(&auth)?;
+    assert_eq!(
+        std::fs::metadata(&auth_file)?.permissions().mode() & 0o777,
+        0o600
+    );
+
+    std::fs::set_permissions(&auth_file, std::fs::Permissions::from_mode(0o644))?;
+    storage.save(&auth)?;
+    assert_eq!(
+        std::fs::metadata(&auth_file)?.permissions().mode() & 0o777,
+        0o600
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn file_storage_save_preserves_relative_symlink_chains() -> anyhow::Result<()> {
+    use std::os::unix::fs::symlink;
+
+    // Cover both an existing target and a dangling link into a missing directory.
+    for target_exists in [true, false] {
+        let codex_home = tempdir()?;
+        let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+        let auth = serde_json::from_value(json!({"OPENAI_API_KEY": "new-key"}))?;
+        let auth_file = get_auth_file(codex_home.path());
+        let link = codex_home.path().join("credentials-link");
+        let target = codex_home.path().join("credentials/auth.json");
+        if target_exists {
+            std::fs::create_dir_all(target.parent().context("target parent")?)?;
+            std::fs::write(&target, r#"{"OPENAI_API_KEY":"old-key"}"#)?;
+        }
+        symlink("credentials-link", &auth_file)?;
+        symlink("credentials/auth.json", &link)?;
+
+        storage.save(&auth)?;
+
+        assert_eq!(
+            std::fs::read_link(&auth_file)?,
+            PathBuf::from("credentials-link")
+        );
+        assert_eq!(
+            std::fs::read_link(&link)?,
+            PathBuf::from("credentials/auth.json")
+        );
+        assert_eq!(storage.try_read_auth_json(&target)?, auth);
+        assert_eq!(storage.load()?, Some(auth));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn file_storage_save_rejects_a_symlink_cycle() -> anyhow::Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let codex_home = tempdir()?;
+    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+    let auth = serde_json::from_value(json!({"OPENAI_API_KEY": "test-key"}))?;
+    let auth_file = get_auth_file(codex_home.path());
+    symlink("auth.json", &auth_file)?;
+
+    assert!(storage.save(&auth).is_err());
+    assert_eq!(std::fs::read_link(&auth_file)?, PathBuf::from("auth.json"));
+    assert_eq!(std::fs::read_dir(codex_home.path())?.count(), 1);
+    Ok(())
+}
+
+#[test]
+fn file_storage_save_cleans_up_after_a_publish_failure() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+    let auth = serde_json::from_value(json!({"OPENAI_API_KEY": "test-key"}))?;
+    let auth_file = get_auth_file(codex_home.path());
+    std::fs::create_dir(&auth_file)?;
+    let sentinel = auth_file.join("sentinel");
+    std::fs::write(&sentinel, "preserve this")?;
+
+    assert!(storage.save(&auth).is_err());
+    assert_eq!(std::fs::read_to_string(&sentinel)?, "preserve this");
+    assert_eq!(std::fs::read_dir(codex_home.path())?.count(), 1);
+    assert_eq!(std::fs::read_dir(&auth_file)?.count(), 1);
+    Ok(())
+}
+
 #[tokio::test]
 async fn file_storage_round_trips_agent_identity_auth() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
