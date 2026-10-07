@@ -8,12 +8,15 @@ pub use system_commands::system_path;
 
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashSet;
+use std::fs::OpenOptions;
 use std::hash::Hash;
 use std::io;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
-use tempfile::NamedTempFile;
+use tempfile::Builder;
 
 pub fn normalize_for_path_comparison(path: impl AsRef<Path>) -> std::io::Result<PathBuf> {
     let canonical = path.as_ref().canonicalize()?;
@@ -149,9 +152,20 @@ pub fn write_atomically(write_path: &Path, contents: &str) -> io::Result<()> {
         )
     })?;
     std::fs::create_dir_all(parent)?;
-    let mut tmp = NamedTempFile::new_in(parent)?;
+    // Use normal file attributes: unlike NamedTempFile::new_in on Windows, this
+    // does not mark the file as temporary after it has been published.
+    let mut tmp = Builder::new().make_in(parent, |path| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        options.open(path)
+    })?;
     tmp.write_all(contents.as_bytes())?;
-    tmp.persist(write_path)?;
+    // std::fs::rename supports replacing open readers on modern Windows via
+    // POSIX rename semantics, unlike tempfile's MoveFileExW-only persist path.
+    std::fs::rename(tmp.path(), write_path)?;
+    tmp.disable_cleanup(true);
     Ok(())
 }
 

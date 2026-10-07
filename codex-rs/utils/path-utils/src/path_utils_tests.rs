@@ -1,6 +1,55 @@
 use super::replace_path_and_deduplicate;
+use super::write_atomically;
 use pretty_assertions::assert_eq;
+use std::io::Read;
 use std::path::Path;
+
+#[test]
+fn atomic_write_replaces_a_file_with_an_open_reader() -> std::io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("nested/config");
+    write_atomically(&path, "old complete contents")?;
+    let mut reader = std::fs::File::open(&path)?;
+
+    write_atomically(&path, "new contents")?;
+
+    let mut original = String::new();
+    reader.read_to_string(&mut original)?;
+    assert_eq!(original, "old complete contents");
+    assert_eq!(std::fs::read_to_string(&path)?, "new contents");
+    assert_eq!(std::fs::read_dir(dir.path().join("nested"))?.count(), 1);
+    Ok(())
+}
+
+#[test]
+fn atomic_write_cleans_up_after_a_publish_failure() -> std::io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let destination = dir.path().join("destination");
+    std::fs::create_dir(&destination)?;
+    let sentinel = destination.join("sentinel");
+    std::fs::write(&sentinel, "preserve this")?;
+
+    assert!(write_atomically(&destination, "new contents").is_err());
+
+    assert_eq!(std::fs::read_to_string(&sentinel)?, "preserve this");
+    assert_eq!(std::fs::read_dir(dir.path())?.count(), 1);
+    assert_eq!(std::fs::read_dir(&destination)?.count(), 1);
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn atomic_write_does_not_publish_temporary_attributes() -> std::io::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("config");
+    write_atomically(&path, "contents")?;
+
+    // FILE_ATTRIBUTE_TEMPORARY is 0x100; persisted files must not retain it.
+    assert_eq!(std::fs::metadata(&path)?.file_attributes() & 0x100, 0);
+    Ok(())
+}
 
 #[test]
 fn replace_path_and_deduplicate_preserves_other_paths_and_order() {
